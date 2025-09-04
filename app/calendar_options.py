@@ -1,20 +1,12 @@
-"""
-calendar_options.py
-=======================================================================
-KaChing Calendar Strategy Tab (with Tradier + Chart Embed)
-"""
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-import json
-import os
-from tradier_utils import get_option_chain_with_greeks
+import json, os
+
+from tradier_utils import get_option_chain_with_greeks, get_tradier_expirations
 from embed_tradingview import render_tradingview_chart
 
-IDEA_FILE = os.path.join(os.getcwd(), "Options", "trade_ideas.json")
-
-# --- Earnings + Trend (via yfinance for now) ---
+# Earnings + trend from yfinance
 import yfinance as yf
 
 def fetch_trend(ticker):
@@ -36,8 +28,16 @@ def fetch_trend(ticker):
     except:
         return 0, "-", "-", 0
 
-# --- Find PUT based on delta, bid, theta, vega ---
-def find_put(df, delta_target=0.20, min_bid=0.20, min_theta=None, max_vega=None):
+def get_next_fridays():
+    fridays = []
+    today = datetime.today()
+    while len(fridays) < 2:
+        today += timedelta(days=1)
+        if today.weekday() == 4:
+            fridays.append(today.strftime("%Y-%m-%d"))
+    return fridays[0], fridays[1]
+
+def find_put(df, delta_target=0.2, min_bid=0.2, min_theta=None, max_vega=None):
     df = df.copy()
     df["delta"] = df.get("delta", pd.Series([-0.2] * len(df))).abs()
     if min_theta is not None:
@@ -52,13 +52,11 @@ def find_put(df, delta_target=0.20, min_bid=0.20, min_theta=None, max_vega=None)
         return None
     return df.sort_values("delta_diff").iloc[0]
 
-# --- Save to trade_ideas.json ---
 def save_trade_idea(symbol, long_put, short_put, cost, long_exp, short_exp):
     idea = {
         "timestamp": datetime.now().isoformat(),
         "symbol": symbol,
         "strategy": "Put Calendar",
-        "direction": "Neutral to Bullish",
         "expiry": short_exp,
         "legs_json": [
             {"type": "long_put", "strike": float(long_put.strike), "expiry": long_exp},
@@ -68,42 +66,32 @@ def save_trade_idea(symbol, long_put, short_put, cost, long_exp, short_exp):
         "notes": f"Long {long_put.strike} / Short {short_put.strike}"
     }
     try:
+        path = os.path.join("Options", "trade_ideas.json")
         existing = []
-        if os.path.exists(IDEA_FILE):
-            with open(IDEA_FILE, "r") as f:
+        if os.path.exists(path):
+            with open(path, "r") as f:
                 existing = json.load(f)
         existing.append(idea)
-        with open(IDEA_FILE, "w") as f:
+        with open(path, "w") as f:
             json.dump(existing, f, indent=2)
         return True
     except:
         return False
 
-# --- Get this and next Friday ---
-def get_next_fridays():
-    fridays = []
-    today = datetime.today()
-    while len(fridays) < 2:
-        today += timedelta(days=1)
-        if today.weekday() == 4:
-            fridays.append(today.strftime("%Y-%m-%d"))
-    return fridays[0], fridays[1]
-
-# --- Main Render ---
 def render():
-    st.subheader("📆 KaChing Calendar Strategy (Tradier)")
-    symbol = st.text_input("Enter Ticker", value="SOFI").upper()
+    st.subheader("📆 KaChing Calendar Strategy (with Tradier)")
+
+    symbol = st.text_input("Symbol", value="SOFI").upper()
     if not symbol:
         return
 
-    # --- Trend, RSI, Earnings ---
+    last, trend3, trend1, rsi = fetch_trend(symbol)
     try:
         earnings = yf.Ticker(symbol).calendar.loc["Earnings Date"].values[0].strftime("%Y-%m-%d")
     except:
         earnings = "N/A"
-    last, trend3, trend1, rsi = fetch_trend(symbol)
 
-    st.markdown(f"**Price:** ${last} | 3-Month: {trend3} | Weekly: {trend1} (RSI: {rsi}) | Earnings: {earnings}**")
+    st.markdown(f"**Price:** ${last} | 3M: {trend3} | Weekly: {trend1} (RSI: {rsi}) | Earnings: {earnings}")
     render_tradingview_chart(
         symbol=symbol,
         interval="D",
@@ -116,7 +104,7 @@ def render():
     )
     st.divider()
 
-    # --- Filters ---
+    # Strategy config
     with st.expander("🔧 Configure Strategy"):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -128,60 +116,44 @@ def render():
         with col3:
             max_vega = st.number_input("Max Vega", 0.0, 2.0, 1.5, 0.1)
 
-    # --- Expirations ---
+    # Expirations
+    expirations = get_tradier_expirations(symbol)
+    long_exp = next((d for d in expirations
+                     if (datetime.strptime(d, "%Y-%m-%d") - datetime.today()).days >= long_dte), None)
     short1, short2 = get_next_fridays()
 
-    # Get all expirations from Tradier (via long option chain)
-    tradier_dates = []
-    for dte in range(long_dte, 600, 7):
-        date = (datetime.today() + timedelta(days=dte)).strftime("%Y-%m-%d")
-        df = get_option_chain_with_greeks(symbol, date)
-        if not df.empty:
-            tradier_dates.append(date)
-            break  # take first with valid data
-    long_exp = tradier_dates[0] if tradier_dates else None
-
-    df_long = get_option_chain_with_greeks(symbol, long_exp) if long_exp else pd.DataFrame()
+    df_long = get_option_chain_with_greeks(symbol, long_exp)
     df_short1 = get_option_chain_with_greeks(symbol, short1)
     df_short2 = get_option_chain_with_greeks(symbol, short2)
 
-    long_put = find_put(df_long, delta_target, min_bid)
+    long_put = find_put(df_long, delta_target, min_bid, min_theta, max_vega)
     short_put1 = find_put(df_short1, delta_target, min_bid, min_theta, max_vega)
     short_put2 = find_put(df_short2, delta_target, min_bid, min_theta, max_vega)
 
-    # --- Display Short Puts ---
     colA, colB = st.columns(2)
     with colA:
-        st.markdown(f"### 📅 {short1}")
+        st.markdown(f"### {short1}")
         if isinstance(short_put1, pd.Series):
             st.write(f"PUT {short_put1.strike} @ ${short_put1.bid} (Δ {short_put1.delta:.2f})")
         else:
-            st.warning("⚠️ No suitable PUT found for this week")
+            st.warning("⚠️ No match for this week")
 
     with colB:
-        st.markdown(f"### 📅 {short2}")
+        st.markdown(f"### {short2}")
         if isinstance(short_put2, pd.Series):
             st.write(f"PUT {short_put2.strike} @ ${short_put2.bid} (Δ {short_put2.delta:.2f})")
         else:
-            st.warning("⚠️ No suitable PUT found for next week")
+            st.warning("⚠️ No match for next week")
 
     st.divider()
-
-    # --- Display Long Put ---
     if isinstance(long_put, pd.Series):
         st.success(f"Long PUT: {long_exp} @ {long_put.strike} (${long_put.ask:.2f}, Δ {long_put.delta:.2f})")
-    else:
-        st.warning("No long put found")
 
-    # --- Net Cost + Save ---
     if isinstance(long_put, pd.Series) and isinstance(short_put1, pd.Series):
-        net_cost = float(long_put.ask) - float(short_put1.bid)
-        st.info(f"📊 Net Calendar Cost: ${net_cost:.2f} per share")
+        cost = float(long_put.ask) - float(short_put1.bid)
+        st.info(f"Net Calendar Cost: ${cost:.2f} per share")
         if st.button("💾 Save Trade Idea"):
-            if save_trade_idea(symbol, long_put, short_put1, net_cost, long_exp, short1):
-                st.success("Saved ✅")
+            if save_trade_idea(symbol, long_put, short_put1, cost, long_exp, short1):
+                st.success("Saved!")
             else:
                 st.error("Failed to save")
-st.write("Testing fetch...")
-df = get_option_chain_with_greeks("AAPL", "2025-09-06")
-st.write(df.head())
